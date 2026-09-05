@@ -85,6 +85,86 @@ pub fn link_runs(runs: &mut [SubagentRun]) {
     }
 }
 
+/// How much of the session-level subagent total the per-agent rows account for.
+///
+/// The total and the rows come from different records and can disagree: a
+/// session's total survives as long as the store does, while its per-agent
+/// rows exist only if the transcript was still on disk when run extraction
+/// ran over it. Claude Code prunes transcripts on its own schedule, so a store
+/// analyzed before runs were extracted keeps totals whose rows can never be
+/// recovered — and the rows that *were* extracted would pass for the whole
+/// breakdown unless the gap is reported beside them. Every report that prints
+/// the rows carries this alongside so a partial split is labeled as one.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct SplitCoverage {
+    /// The session-level total: output tokens and run count.
+    pub total_tokens: i64,
+    pub total_runs: i64,
+    /// What the per-agent rows sum to.
+    pub known_tokens: i64,
+    pub known_runs: i64,
+    /// The part of the total no row accounts for — never negative.
+    pub missing_tokens: i64,
+    pub missing_runs: i64,
+}
+
+impl SplitCoverage {
+    /// Compare a session-level total against per-agent `rows` of
+    /// `(runs, out_tokens)`.
+    pub fn new(
+        total_tokens: i64,
+        total_runs: i64,
+        rows: impl IntoIterator<Item = (i64, i64)>,
+    ) -> Self {
+        let (known_runs, known_tokens) = rows
+            .into_iter()
+            .fold((0, 0), |(runs, tokens), (r, t)| (runs + r, tokens + t));
+        Self {
+            total_tokens,
+            total_runs,
+            known_tokens,
+            known_runs,
+            missing_tokens: (total_tokens - known_tokens).max(0),
+            missing_runs: (total_runs - known_runs).max(0),
+        }
+    }
+
+    /// A nonzero total with no rows behind it at all — the split was never
+    /// extracted, which a refresh may still fix. Either axis makes the total
+    /// nonzero: a run that wrote nothing is still a run.
+    pub fn is_unavailable(&self) -> bool {
+        (self.total_tokens > 0 || self.total_runs > 0)
+            && self.known_runs == 0
+            && self.known_tokens == 0
+    }
+
+    /// Rows exist but fall short of the total — the remainder belongs to
+    /// sessions whose runs are gone for good.
+    pub fn is_partial(&self) -> bool {
+        !self.is_unavailable() && (self.missing_tokens > 0 || self.missing_runs > 0)
+    }
+
+    /// Whether `tokens` (a subset of the rows) is more than half the total —
+    /// the bar for calling those rows "most of" the subagent output.
+    pub fn is_majority(&self, tokens: i64) -> bool {
+        self.total_tokens > 0 && tokens * 2 > self.total_tokens
+    }
+
+    /// The sentence a report prints beside a partial split, with exact
+    /// figures: what the rows cover, what they do not, and why the rest can
+    /// never be filled in. `None` when there is no gap to explain.
+    pub fn partial_note(&self) -> Option<String> {
+        self.is_partial().then(|| {
+            format!(
+                "per-agent split covers {} tokens over {} run(s); the other {} tokens over \
+                 {} run(s) have no split (analyzed before runs were extracted, transcripts \
+                 since pruned)",
+                self.known_tokens, self.known_runs, self.missing_tokens, self.missing_runs
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +222,86 @@ mod tests {
         ];
         link_runs(&mut runs);
         assert!(runs.iter().all(|r| r.root_tool_use_id.is_none()));
+    }
+
+    #[test]
+    fn rows_summing_to_the_total_are_a_complete_split() {
+        let coverage = SplitCoverage::new(1_800_000, 300, [(220, 1_500_000), (80, 300_000)]);
+        assert_eq!(coverage.missing_tokens, 0);
+        assert_eq!(coverage.missing_runs, 0);
+        assert!(!coverage.is_partial());
+        assert!(!coverage.is_unavailable());
+    }
+
+    #[test]
+    fn rows_short_of_the_total_are_a_partial_split() {
+        // Sessions analyzed before per-run extraction keep their totals, but
+        // once Claude Code pruned their transcripts the runs can never be
+        // extracted — so the rows that were cover only a fraction.
+        let coverage = SplitCoverage::new(3_093_466, 375, [(11, 315_663), (14, 62_067)]);
+        assert_eq!(coverage.known_tokens, 377_730);
+        assert_eq!(coverage.known_runs, 25);
+        assert_eq!(coverage.missing_tokens, 2_715_736);
+        assert_eq!(coverage.missing_runs, 350);
+        assert!(coverage.is_partial());
+        assert!(!coverage.is_unavailable());
+    }
+
+    #[test]
+    fn no_rows_behind_a_nonzero_total_is_an_unavailable_split() {
+        let coverage = SplitCoverage::new(3_093_466, 375, []);
+        assert!(coverage.is_unavailable());
+        assert!(!coverage.is_partial());
+    }
+
+    #[test]
+    fn no_rows_behind_runs_that_wrote_nothing_is_still_an_unavailable_split() {
+        // A run that produced no output still counts as a run, so a total can
+        // be nonzero on the run axis alone — and rows are just as absent.
+        let coverage = SplitCoverage::new(0, 3, []);
+        assert!(coverage.is_unavailable());
+        assert!(!coverage.is_partial());
+    }
+
+    #[test]
+    fn no_rows_behind_a_zero_total_is_neither_partial_nor_unavailable() {
+        let coverage = SplitCoverage::new(0, 0, []);
+        assert!(!coverage.is_partial());
+        assert!(!coverage.is_unavailable());
+    }
+
+    #[test]
+    fn rows_exceeding_the_total_report_no_gap() {
+        // The gap is reported as what is missing, never as a negative figure.
+        let coverage = SplitCoverage::new(100, 1, [(2, 150)]);
+        assert_eq!(coverage.missing_tokens, 0);
+        assert_eq!(coverage.missing_runs, 0);
+        assert!(!coverage.is_partial());
+    }
+
+    #[test]
+    fn a_majority_is_more_than_half_of_the_total() {
+        let coverage = SplitCoverage::new(1_000, 10, [(10, 1_000)]);
+        assert!(coverage.is_majority(501));
+        assert!(!coverage.is_majority(500));
+        // A zero total has no majority to claim.
+        assert!(!SplitCoverage::new(0, 0, []).is_majority(0));
+    }
+
+    #[test]
+    fn a_partial_split_explains_its_gap_and_a_complete_one_says_nothing() {
+        let partial = SplitCoverage::new(3_093_466, 375, [(11, 315_663), (14, 62_067)]);
+        assert_eq!(
+            partial.partial_note().as_deref(),
+            Some(
+                "per-agent split covers 377730 tokens over 25 run(s); the other 2715736 tokens \
+                 over 350 run(s) have no split (analyzed before runs were extracted, \
+                 transcripts since pruned)"
+            )
+        );
+        assert_eq!(SplitCoverage::new(100, 1, [(1, 100)]).partial_note(), None);
+        // An unavailable split is a different message (a refresh may fix it),
+        // so it is not described as partial.
+        assert_eq!(SplitCoverage::new(100, 1, []).partial_note(), None);
     }
 }
