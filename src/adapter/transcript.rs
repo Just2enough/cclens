@@ -5,6 +5,7 @@
 //! deserializes defensively: only the needed fields, unknown fields ignored, a
 //! line that fails to parse or lacks a timestamp simply yields no records.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -17,14 +18,22 @@ use crate::core::span::{Record, RecordKind, Source};
 
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 
-/// Parse one transcript's text into domain records, in file order. The current
-/// turn's prompt id is threaded forward and stamped onto agent spawns, whose own
-/// record does not carry it — that id is the join key to the subagent transcript.
+/// Parse one transcript's text into domain records, in file order. Two things
+/// are threaded across lines: the current turn's prompt id, stamped onto agent
+/// spawns whose own record does not carry it (the join key to the subagent
+/// transcript), and the output each API response has already reported, so a
+/// response written as several lines is charged once (`assistant_records`).
 pub fn parse_session(jsonl: &str) -> Vec<Record> {
     let mut current_prompt_id: Option<String> = None;
+    let mut reported_output: HashMap<String, u64> = HashMap::new();
     let mut records = Vec::new();
     for line in jsonl.lines() {
-        parse_line(line, &mut current_prompt_id, &mut records);
+        parse_line(
+            line,
+            &mut current_prompt_id,
+            &mut reported_output,
+            &mut records,
+        );
     }
     records
 }
@@ -51,6 +60,10 @@ struct Raw {
 
 #[derive(Deserialize)]
 struct RawMessage {
+    /// The API response id. Shared by every line the response was written as
+    /// (one per content block), which is what lets its usage be counted once
+    /// (`assistant_records`).
+    id: Option<String>,
     model: Option<String>,
     usage: Option<RawUsage>,
     content: Option<Value>,
@@ -64,7 +77,12 @@ struct RawUsage {
     output_tokens: Option<u64>,
 }
 
-fn parse_line(line: &str, current_prompt_id: &mut Option<String>, out: &mut Vec<Record>) {
+fn parse_line(
+    line: &str,
+    current_prompt_id: &mut Option<String>,
+    reported_output: &mut HashMap<String, u64>,
+    out: &mut Vec<Record>,
+) {
     let Ok(raw) = serde_json::from_str::<Raw>(line) else {
         return;
     };
@@ -76,7 +94,7 @@ fn parse_line(line: &str, current_prompt_id: &mut Option<String>, out: &mut Vec<
     };
 
     let mut records = match raw.kind.as_deref() {
-        Some("assistant") => assistant_records(ts, raw.message.as_ref()),
+        Some("assistant") => assistant_records(ts, raw.message.as_ref(), reported_output),
         Some("user") | Some("system") => prompt_or_invocation(ts, &raw, line),
         _ => Vec::new(),
     };
@@ -91,7 +109,24 @@ fn parse_line(line: &str, current_prompt_id: &mut Option<String>, out: &mut Vec<
 /// An assistant line yields its accumulated cost, plus a tool-path skill
 /// invocation when it called the Skill tool (emitted first so the span starts
 /// at the invocation and includes the calling turn's cost).
-fn assistant_records(ts: i64, message: Option<&RawMessage>) -> Vec<Record> {
+///
+/// A line is not an API response: Claude Code writes one line per content
+/// block of a response, every line carrying a usage object under the same
+/// `message.id`. On the main thread each line repeats the response's final
+/// usage; in a subagent transcript each carries the running total so far. The
+/// record's `out_tokens` is therefore the *increment* over what earlier lines
+/// of the same response already reported — the whole value on the first line
+/// and zero on a repeat, or each step of a running total — so the core can sum
+/// records and count every response exactly once, whichever shape the lines
+/// take and wherever a span boundary falls between them. Every line still
+/// yields a record, so timestamps and prompt sizes are seen as before. A line
+/// with no id has nothing to reconcile against and reports its value as is.
+/// See `docs/specs/session-format.md`.
+fn assistant_records(
+    ts: i64,
+    message: Option<&RawMessage>,
+    reported_output: &mut HashMap<String, u64>,
+) -> Vec<Record> {
     let Some(message) = message else {
         return Vec::new();
     };
@@ -116,11 +151,21 @@ fn assistant_records(ts: i64, message: Option<&RawMessage>) -> Vec<Record> {
         let prompt_size = usage.input_tokens.unwrap_or(0)
             + usage.cache_read_input_tokens.unwrap_or(0)
             + usage.cache_creation_input_tokens.unwrap_or(0);
+        let output = usage.output_tokens.unwrap_or(0);
+        let out_tokens = match &message.id {
+            Some(id) => {
+                let reported = reported_output.entry(id.clone()).or_insert(0);
+                let increment = output.saturating_sub(*reported);
+                *reported = (*reported).max(output);
+                increment
+            }
+            None => output,
+        };
         records.push(Record {
             timestamp_ms: ts,
             kind: RecordKind::Assistant {
                 prompt_size,
-                out_tokens: usage.output_tokens.unwrap_or(0),
+                out_tokens,
                 model: message
                     .model
                     .clone()
@@ -688,6 +733,93 @@ mod tests {
         assert_eq!(span.ctx_growth, 150); // (250 - 100), the closing prompt excluded
         assert_eq!(span.duration_sec, 3.0); // last in-window record at 3s, start at 0s
         assert_eq!(span.model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn a_main_thread_message_split_across_lines_is_counted_once() {
+        // Claude Code writes one line per content block (thinking, text,
+        // tool_use) of an assistant message, and on the main thread every line
+        // repeats the same `message.usage`. Three lines are one API response.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"<command-name>/git-commit</command-name>"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.500Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"text","text":"..."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"tool_use","name":"Bash","input":{"command":"true"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"id":"msg_b","model":"claude-opus-4-7","usage":{"input_tokens":0,"cache_read_input_tokens":250,"cache_creation_input_tokens":0,"output_tokens":60},"content":[{"type":"text","text":"done"}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:05.000Z","message":{"content":"thanks"}}"#,
+        );
+
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
+
+        let span = &spans[0];
+        assert_eq!(span.out_tokens, 160); // msg_a once (100) + msg_b (60)
+        // The repeated lines still shape the other metrics exactly as before.
+        assert_eq!(span.ctx_growth, 150);
+        assert_eq!(span.duration_sec, 4.0);
+    }
+
+    #[test]
+    fn a_message_whose_lines_straddle_a_span_boundary_is_charged_once() {
+        // The response thinks inside the first span, then its tool_use line
+        // invokes a skill — which closes that span and opens the next one. The
+        // response's output must land in exactly one of the two.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:00.000Z","message":{"content":"<command-name>/git-commit</command-name>"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"tool_use","name":"Skill","input":{"skill":"loop"}}]}}"#,
+            "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:05.000Z","message":{"content":"thanks"}}"#,
+        );
+
+        let spans = extract_spans(
+            &parse_session(jsonl),
+            crate::core::span::DEFAULT_IDLE_GAP_MS,
+        );
+
+        assert_eq!(spans.len(), 2);
+        let total: u64 = spans.iter().map(|span| span.out_tokens).sum();
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn an_assistant_line_without_a_message_id_keeps_its_own_value() {
+        // Nothing ties id-less lines together, so each reports what it carries.
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"model":"claude-opus-4-7","usage":{"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"model":"claude-opus-4-7","usage":{"output_tokens":40}}}"#,
+        );
+
+        let total = crate::core::usage::output_tokens(&parse_session(jsonl));
+
+        assert_eq!(total, 80);
+    }
+
+    #[test]
+    fn a_subagent_message_split_across_lines_keeps_its_final_cumulative_value() {
+        // In a subagent transcript the per-line usage of a multi-line message is
+        // a running total, not a repeat: the last line carries the whole message.
+        let jsonl = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":30},"content":[{"type":"thinking","thinking":"..."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02.000Z","message":{"id":"msg_a","model":"claude-opus-4-7","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":0,"output_tokens":100},"content":[{"type":"tool_use","name":"Bash","input":{"command":"true"}}]}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:04.000Z","message":{"id":"msg_b","model":"claude-opus-4-7","usage":{"input_tokens":0,"cache_read_input_tokens":250,"cache_creation_input_tokens":0,"output_tokens":20},"content":[{"type":"text","text":"done"}]}}"#,
+        );
+
+        let total = crate::core::usage::output_tokens(&parse_session(jsonl));
+
+        assert_eq!(total, 120); // msg_a's final 100 + msg_b's 20
     }
 
     #[test]

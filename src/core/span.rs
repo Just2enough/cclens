@@ -26,6 +26,9 @@ pub enum RecordKind {
     Assistant {
         /// `input + cache_read + cache_creation` — the full prompt size.
         prompt_size: u64,
+        /// Output first reported by this record. The adapter reconciles the
+        /// several records one API response can yield, so summing this over
+        /// any run of records counts each response exactly once.
         out_tokens: u64,
         /// The model, or the `<synthetic>` sentinel.
         model: String,

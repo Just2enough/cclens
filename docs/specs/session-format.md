@@ -50,6 +50,22 @@ rest; unknown types are skipped.
 - `timestamp` — ISO-8601, millisecond precision, **UTC** (`Z` suffix, e.g.
   `2026-05-14T22:40:06.133Z`). Parsed to a UTC instant; timezone presentation
   happens later (`cli.md`).
+- `message.id` — the API response id. One response is written as **several
+  lines, one per content block** (`thinking`, `text`, `tool_use`), and every
+  line repeats `message.model` and carries a `message.usage`; the id is what
+  ties them back to one response. The lines take two shapes: on the main
+  thread each line's `output_tokens` is the response's final value repeated;
+  in a subagent transcript it is a running total that only grows, the last
+  line carrying the whole response. The adapter reconciles both at parse time
+  by emitting, per line, only the output not yet reported under that id — the
+  whole value on the first line and zero on a repeat, or each step of a
+  running total (`adapter::transcript::assistant_records`). That is the
+  per-id maximum, spread over the lines that first observed it, so the core
+  can sum records and count each response once (`events.md`). Keeping the
+  *first* line's value instead would under-count subagents badly, and
+  `stop_reason` is no substitute: every main-thread line carries one, and some
+  subagent responses carry it on no line. A line with no id reports its value
+  as is.
 - `message.model` — e.g. `claude-opus-4-7`. May be the sentinel `<synthetic>`
   for locally-generated turns; excluded when choosing an event's representative
   model (`events.md`).
