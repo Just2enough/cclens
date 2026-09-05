@@ -195,7 +195,12 @@ run, and the **root** `tool_use_id` its tree started at (`core::subagent`).
 - **Every run counts once, at its own cost, whatever its depth.** A nested run
   is the agent that wrote those tokens; folding it into its parent's type would
   bill an agent that only delegated. So the per-agent rows sum exactly to the
-  session-level total.
+  session-level total — for every session whose runs could be extracted. A
+  session analyzed before runs were extracted keeps its total, but once Claude
+  Code has pruned its transcripts its runs are gone for good, so a store can
+  hold rows for only part of its total; reports reconcile the two and label
+  the rows a partial split (`core::subagent::SplitCoverage`, `cli.md`'s
+  reporting-honesty rules).
 - **A run whose agent type is unknown** (no sidecar) is kept, grouped under
   "unknown". Dropping it would silently break that sum; guessing a type would
   be worse.
@@ -279,7 +284,9 @@ skills that genuinely spawn their own agents) but is **not rolled up into the
 per-skill report**, where it would over-count. The authoritative subagent figure
 is the **session-level total** (`sessions.sub_tokens`), which is exact — every
 subagent run counted once, no window guess involved — and the per-agent split of
-that total (`subagent_runs`) is exact for the same reason.
+that total (`subagent_runs`) is exact for the same reason wherever it exists.
+The two are recorded separately, so the split can cover only part of the total
+in a store that outlived the transcripts behind it; see the runs section above.
 
 ## Determinism
 
