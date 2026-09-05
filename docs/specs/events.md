@@ -132,7 +132,7 @@ Each metric is computed from the records strictly within the event/span.
 
 | Metric | Definition |
 | --- | --- |
-| `out_tokens` | Sum of `output_tokens` over the span's `assistant` records. |
+| `out_tokens` | Sum of `out_tokens` over the span's `assistant` records. Each record carries only the output it is the first to report, so the sum counts every API response once however many records it was written as; see "One message, several records" below. |
 | `ctx_growth` | **Compaction-safe** context consumption: the sum of *positive* differences in prompt size between consecutive `assistant` records. Decreases (compaction, cache eviction) are clipped to zero. |
 | `ctx_start` | Prompt size at the span's first `assistant` record — *where this skill ran*, not where the session began. See "The session-start context is its own event" below. |
 | `ctx_peak` | Maximum prompt size across the span's `assistant` records. |
@@ -141,6 +141,25 @@ Each metric is computed from the records strictly within the event/span.
 | `sub_agent_count` | Number of subagents attributed. |
 | `sub_tokens_estimated` | True when any attributed subagent was equally split (below). |
 | `model` | Representative model: the first `assistant` record whose model is **not** `<synthetic>`. NULL if none qualifies. |
+
+### One message, several records
+
+An `assistant` record is one transcript line, and one API response is written
+as several lines whose usage objects repeat or accumulate the same output
+(`session-format.md`). Summed naively, a response is charged once per line —
+and the factor varies by skill (how often the model thinks before it acts), so
+the error reorders skill rankings rather than merely inflating every figure.
+
+The core does not see this. The adapter reconciles the lines of a response as
+it parses, so each record's `out_tokens` is only the output that record is the
+first to report; the core sums records exactly as the definition above says
+and every response lands once. This keeps the layout knowledge where the
+format-isolation rule wants it, and it also settles the boundary case: when a
+span closes between two lines of one response (the response thought inside
+one skill and then invoked the next), the output is charged to the span that
+saw it first, never to both. Every line still yields a record, so
+`ctx_growth`, `ctx_start`, `ctx_peak` and `duration_sec` see the same
+timestamps and prompt sizes they always did.
 
 ### Why `ctx_growth`, not max-minus-start
 
