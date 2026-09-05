@@ -22,7 +22,7 @@ use crate::core::friction::ErrorCategory;
 use crate::core::optimize as optimize_mod;
 use crate::core::scope::{ScopeFilter, split_friction};
 use crate::core::span::{DEFAULT_IDLE_GAP_MS, SessionStart, extract_spans, session_start};
-use crate::core::subagent::{SubagentRun, link_runs};
+use crate::core::subagent::{SplitCoverage, SubagentRun, link_runs};
 use crate::core::surface::{
     LoadMode, Scope, StartupSavings, Surface, Wedge, classify_wedge, is_usage_measurable,
     on_demand_tokens, startup_savings,
@@ -616,19 +616,25 @@ fn collect_findings(store: &Store) -> Result<optimize_mod::Findings> {
     };
 
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
+    let agents: Vec<optimize_mod::AgentCost> = store
+        .subagent_by_agent()?
+        .into_iter()
+        .map(|row| optimize_mod::AgentCost {
+            agent: row.agent,
+            runs: row.runs,
+            out_tokens: row.out_tokens,
+        })
+        .collect();
     Ok(optimize_mod::Findings {
         main_out: store.skill_usage()?.iter().map(|r| r.out_tokens).sum(),
         sub_tokens,
         sub_agents,
-        agents: store
-            .subagent_by_agent()?
-            .into_iter()
-            .map(|row| optimize_mod::AgentCost {
-                agent: row.agent,
-                runs: row.runs,
-                out_tokens: row.out_tokens,
-            })
-            .collect(),
+        agent_split: SplitCoverage::new(
+            sub_tokens,
+            sub_agents,
+            agents.iter().map(|a| (a.runs, a.out_tokens)),
+        ),
+        agents,
         floor,
         config_tokens: if floor > 0 {
             store.always_on_config_tokens()?
@@ -942,39 +948,13 @@ fn doctor(filter: &ScopeFilter, format: Format, frozen: bool, db: &Path) -> Resu
             fmt_tokens(f.sub_tokens),
             f.sub_agents
         );
-        warn_missing_agent_split(f.sub_tokens, f.agents.is_empty());
-        // Name the agents behind that second figure — it is usually the larger
-        // one, and "which agent" is the actionable half of it.
-        let top: Vec<String> = f
-            .agents
-            .iter()
-            .take(3)
-            .map(|a| {
-                format!(
-                    "{} {} ({} run{})",
-                    a.label(),
-                    fmt_tokens(a.out_tokens),
-                    a.runs,
-                    if a.runs == 1 { "" } else { "s" }
-                )
-            })
-            .collect();
-        if !top.is_empty() {
-            println!(
-                "  Most of that subagent output: {}. Full split: {}",
-                top.join(", "),
-                style.command("cclens usage")
-            );
-        }
-        // Never truncate silently (reporting honesty, cli.md).
-        if f.agents.len() > top.len() {
-            println!(
-                "  {}",
-                style.dim(&format!(
-                    "… and {} more agent type(s) not shown",
-                    f.agents.len() - top.len()
-                ))
-            );
+        warn_missing_agent_split(&f.agent_split);
+        for line in doctor_agent_lines(&f, &style.command("cclens usage")) {
+            if line.starts_with('…') {
+                println!("  {}", style.dim(&line));
+            } else {
+                println!("  {line}");
+            }
         }
     }
 
@@ -1084,6 +1064,62 @@ fn plural(n: usize, noun: &str) -> String {
     } else {
         format!("{n} {noun}s")
     }
+}
+
+/// The doctor's lines naming the agents behind the subagent figure — "which
+/// agent" is the actionable half of it. The top rows are introduced as "most
+/// of" the output only when they actually exceed half of it; when the rows
+/// are a partial split (`SplitCoverage`), the gap is stated first so the
+/// names are not read as the whole bill. `full_split` is the styled command
+/// that shows every row. An unavailable split yields nothing: that case is
+/// reported on stderr with its refresh hint.
+fn doctor_agent_lines(f: &optimize_mod::Findings, full_split: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let top: Vec<String> = f
+        .agents
+        .iter()
+        .take(3)
+        .map(|a| {
+            format!(
+                "{} {} ({} run{})",
+                a.label(),
+                fmt_tokens(a.out_tokens),
+                a.runs,
+                if a.runs == 1 { "" } else { "s" }
+            )
+        })
+        .collect();
+    if top.is_empty() {
+        return lines;
+    }
+    let coverage = &f.agent_split;
+    let shown: i64 = f.agents.iter().take(top.len()).map(|a| a.out_tokens).sum();
+    let intro = if coverage.is_partial() {
+        lines.push(format!(
+            "Only {} of those tokens ({} of {} runs) have a per-agent split — the rest were \
+             analyzed before runs were extracted and their transcripts are gone.",
+            fmt_tokens(coverage.known_tokens),
+            coverage.known_runs,
+            coverage.total_runs
+        ));
+        "Among the runs that have one"
+    } else if coverage.is_majority(shown) {
+        "Most of that subagent output"
+    } else {
+        "The largest agent types"
+    };
+    lines.push(format!(
+        "{intro}: {}. Full split: {full_split}",
+        top.join(", ")
+    ));
+    // Never truncate silently (reporting honesty, cli.md).
+    if f.agents.len() > top.len() {
+        lines.push(format!(
+            "… and {} more agent type(s) not shown",
+            f.agents.len() - top.len()
+        ));
+    }
+    lines
 }
 
 /// Humanize a token count: `6467406` → `6.5M`, `32139` → `32.1k`.
@@ -1725,8 +1761,12 @@ fn open_for_read(db: &Path, frozen: bool) -> Result<Store> {
 /// is the substitution it forbids (`docs/specs/storage.md`). It goes to stderr
 /// with the other staleness signals, so piped stdout and `--format json` stay
 /// clean.
-fn warn_missing_agent_split(sub_tokens: i64, agents_empty: bool) {
-    if sub_tokens > 0 && agents_empty {
+///
+/// A *partial* split is not warned about here: it is a property of the data
+/// that no refresh can change, so each report labels it in-band beside the
+/// rows it qualifies (`SplitCoverage::partial_note`).
+fn warn_missing_agent_split(coverage: &SplitCoverage) {
+    if coverage.is_unavailable() {
         eprintln!(
             "{}",
             Style::stderr().warn(
@@ -1890,10 +1930,19 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
     let main_out: i64 = skills.iter().map(|row| row.out_tokens).sum();
     let (sub_tokens, sub_agents) = store.subagent_totals()?;
     let agents = store.subagent_by_agent()?;
+    // How much of the total the rows actually account for: a store that kept
+    // totals for sessions whose transcripts were pruned before their runs were
+    // extracted has rows for only part of it, and the rows must not pass for
+    // the whole. It travels with the rows in every format.
+    let agent_split = SplitCoverage::new(
+        sub_tokens,
+        sub_agents,
+        agents.iter().map(|a| (a.runs, a.out_tokens)),
+    );
     // Ahead of the format branches: a machine consumer reading an empty `agents`
     // beside a nonzero total needs the reason as much as a human does, and it
     // goes to stderr precisely so it can be given to both.
-    warn_missing_agent_split(sub_tokens, agents.is_empty());
+    warn_missing_agent_split(&agent_split);
     if format == Format::Json {
         return emit_json(&serde_json::json!({
             "tokens": {
@@ -1901,6 +1950,7 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
                 "sub_tokens": sub_tokens,
                 "sub_agents": sub_agents,
             },
+            "agent_split": agent_split,
             "agents": agents,
             "skills": skills,
         }));
@@ -1920,8 +1970,14 @@ fn usage(by: Option<&str>, format: Format, frozen: bool, db: &Path) -> Result<()
          A section with nothing to show is omitted.",
     );
     println!(
-        "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)\n"
+        "tokens: main-thread skill output {main_out}, subagents {sub_tokens} ({sub_agents} agents)"
     );
+    // Stated between the total and the table, so the table below is read as
+    // the part it is.
+    if let Some(note) = agent_split.partial_note() {
+        println!("{note}");
+    }
+    println!();
 
     // The subagent figure is usually the larger one, so break it down by agent
     // type before the per-skill table: a spawn count alone cannot tell an
@@ -2683,6 +2739,100 @@ fn pad(text: &str, width: usize, align: Align) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(name: &str, runs: i64, out_tokens: i64) -> optimize_mod::AgentCost {
+        optimize_mod::AgentCost {
+            agent: Some(name.to_string()),
+            runs,
+            out_tokens,
+        }
+    }
+
+    fn findings_with_agents(
+        sub_tokens: i64,
+        sub_agents: i64,
+        agents: Vec<optimize_mod::AgentCost>,
+    ) -> optimize_mod::Findings {
+        optimize_mod::Findings {
+            sub_tokens,
+            sub_agents,
+            agent_split: SplitCoverage::new(
+                sub_tokens,
+                sub_agents,
+                agents.iter().map(|a| (a.runs, a.out_tokens)),
+            ),
+            agents,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn doctor_calls_the_top_rows_most_of_the_output_only_when_they_are() {
+        let f = findings_with_agents(
+            1_000_000,
+            10,
+            vec![agent("a", 4, 700_000), agent("b", 6, 300_000)],
+        );
+        let lines = doctor_agent_lines(&f, "cclens usage");
+        assert_eq!(
+            lines,
+            vec![
+                "Most of that subagent output: a 700.0k (4 runs), b 300.0k (6 runs). \
+                 Full split: cclens usage"
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_call_a_minority_of_the_output_most_of_it() {
+        // A long tail: ten types at a tenth each, so the three shown cover 30%
+        // of the output, and "most" would be false even with a complete split.
+        let agents: Vec<_> = (0..10)
+            .map(|i| agent(&format!("t{i}"), 1, 100_000))
+            .collect();
+        let f = findings_with_agents(1_000_000, 10, agents);
+        let lines = doctor_agent_lines(&f, "cclens usage");
+        assert_eq!(
+            lines,
+            vec![
+                "The largest agent types: t0 100.0k (1 run), t1 100.0k (1 run), t2 100.0k \
+                 (1 run). Full split: cclens usage",
+                "… and 7 more agent type(s) not shown",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_labels_a_partial_split_before_naming_its_agents() {
+        // The rows explain 12% of the total: saying "most of that output" here
+        // would blame the listed types for tokens no row accounts for.
+        let f = findings_with_agents(
+            3_093_466,
+            375,
+            vec![
+                agent("general-purpose", 11, 315_663),
+                agent("codex:codex-rescue", 14, 62_067),
+            ],
+        );
+        let lines = doctor_agent_lines(&f, "cclens usage");
+        assert_eq!(
+            lines,
+            vec![
+                "Only 377.7k of those tokens (25 of 375 runs) have a per-agent split — the \
+                 rest were analyzed before runs were extracted and their transcripts are gone.",
+                "Among the runs that have one: general-purpose 315.7k (11 runs), \
+                 codex:codex-rescue 62.1k (14 runs). Full split: cclens usage",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_names_no_agents_when_the_split_is_unavailable() {
+        // The gap is reported on stderr with its refresh hint; there is
+        // nothing to list in-band.
+        let f = findings_with_agents(3_093_466, 375, vec![]);
+        assert!(doctor_agent_lines(&f, "cclens usage").is_empty());
+    }
 
     /// A path in the temp dir that no other test uses, removed on drop so a
     /// failure does not leak a file into the runner's temp dir.

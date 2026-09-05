@@ -916,7 +916,11 @@ impl Store {
     /// is the agent that produced those tokens, and rolling it into its parent's
     /// type would credit the cost to an agent that only delegated. Runs whose
     /// type is unknown (no sidecar beside the transcript) group under `None`
-    /// rather than being dropped, so the rows still sum to the total.
+    /// rather than being dropped, so the rows sum to the total of every run
+    /// that was extracted. Sessions whose transcripts were pruned before their
+    /// runs could be extracted keep their totals but have no rows here; a
+    /// report reconciles the two with `core::subagent::SplitCoverage` rather
+    /// than presenting these rows as the whole breakdown.
     pub fn subagent_by_agent(&self) -> Result<Vec<AgentCost>> {
         let mut stmt = self.conn.prepare(
             "SELECT agent, COUNT(*), COALESCE(SUM(out_tokens), 0)

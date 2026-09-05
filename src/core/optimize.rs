@@ -6,6 +6,7 @@
 
 use crate::core::friction::ErrorCategory;
 use crate::core::scope::ScopeFilter;
+use crate::core::subagent::SplitCoverage;
 
 /// The complete analysis the briefing renders — every view's detail as owned
 /// data, so the seeded session has the full picture in hand and need not re-run
@@ -20,6 +21,11 @@ pub struct Findings {
     /// The subagent total broken out per agent type, costliest first — which
     /// agent configurations that total actually paid for.
     pub agents: Vec<AgentCost>,
+    /// How much of `sub_tokens` / `sub_agents` the `agents` rows account for.
+    /// Sessions whose transcripts were pruned before their runs were extracted
+    /// keep their totals but never get rows, so the rows can be a partial
+    /// breakdown — and must be labeled as one wherever they are shown.
+    pub agent_split: SplitCoverage,
     /// Empirical always-on floor; 0 means unknown (section omitted).
     pub floor: i64,
     /// Global always-on config tokens (project config is per-project).
@@ -220,6 +226,12 @@ pub fn render_briefing(f: &Findings, filter: &ScopeFilter) -> String {
             "- Subagents: {} ({} agents)\n",
             f.sub_tokens, f.sub_agents
         ));
+        // Rows that fall short of the total are labeled before they are listed:
+        // read as the whole breakdown, they would pin the entire subagent bill
+        // on whichever types happened to be extracted.
+        if let Some(note) = f.agent_split.partial_note() {
+            out.push_str(&format!("  - {note}\n"));
+        }
         // Which agent types that total paid for — the split two agents with
         // similar spawn counts and very different output can only show here.
         for agent in &f.agents {
@@ -488,6 +500,7 @@ mod tests {
                     out_tokens: 300_000,
                 },
             ],
+            agent_split: SplitCoverage::new(1_800_000, 300, [(220, 1_500_000), (80, 300_000)]),
             floor: 35_000,
             config_tokens: 2_000,
             friction_global: vec![FrictionCat {
@@ -705,6 +718,31 @@ mod tests {
         // A run whose agent type was never recorded is shown as unknown, not
         // dropped — the per-agent rows must still sum to the total.
         assert!(brief.contains("  - (unknown): 300000 over 80 run(s)"));
+        // Rows that sum to the total need no coverage caveat.
+        assert!(!brief.contains("per-agent split covers"));
+    }
+
+    #[test]
+    fn briefing_labels_a_partial_agent_split_as_partial() {
+        // Sessions analyzed before runs were extracted keep their totals, but
+        // their pruned transcripts can never yield rows — so the rows shown
+        // explain only a fraction of the total, and the briefing must say so
+        // before the advisor blames the listed agent types for all of it.
+        let mut f = findings();
+        f.sub_tokens = 3_093_466;
+        f.sub_agents = 375;
+        f.agents = vec![AgentCost {
+            agent: Some("general-purpose".to_string()),
+            runs: 25,
+            out_tokens: 377_730,
+        }];
+        f.agent_split = SplitCoverage::new(3_093_466, 375, [(25, 377_730)]);
+        let brief = render_briefing(&f, &ScopeFilter::All);
+        assert!(brief.contains("- Subagents: 3093466 (375 agents)"));
+        assert!(brief.contains(
+            "  - per-agent split covers 377730 tokens over 25 run(s); the other \
+             2715736 tokens over 350 run(s) have no split"
+        ));
     }
 
     #[test]
